@@ -9,12 +9,10 @@ from typing import Set, Dict, Optional, List
 from dataclasses import dataclass, field
 
 from pymax import SocketMaxClient
-from pymax.filters import Filters
-from pymax.types import Message, PhotoAttach, VideoAttach, FileAttach, AudioAttach
+from pymax.types import Message, PhotoAttach, VideoAttach, FileAttach
 from pymax.payloads import UserAgentPayload
-from pymax.files import Photo, Video, File
 import aiohttp
-from telegram import Bot, InputMediaPhoto, InputMediaVideo, InputMediaDocument
+from telegram import Bot
 from telegram.constants import ParseMode
 
 # Настройка логирования
@@ -94,250 +92,7 @@ class StateManager:
         """Проверяет, было ли сообщение обработано"""
         return message_hash in self.processed_messages
 
-class MediaDownloader:
-    """Загрузка медиафайлов из Max"""
-    
-    def __init__(self, download_path: str, timeout: int = 30):
-        self.download_path = Path(download_path)
-        self.download_path.mkdir(exist_ok=True)
-        self.timeout = aiohttp.ClientTimeout(total=timeout)
-        self.session: Optional[aiohttp.ClientSession] = None
-        
-    async def __aenter__(self):
-        connector = aiohttp.TCPConnector(limit=10)
-        self.session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=self.timeout
-        )
-        return self
-        
-    async def __aexit__(self, *args):
-        if self.session:
-            await self.session.close()
-    
-    async def download_file(self, url: str, filepath: Path) -> bool:
-        """Скачивает файл по URL"""
-        try:
-            async with self.session.get(url) as response:
-                if response.status == 200:
-                    # Скачиваем файл синхронно, так как aiofiles недоступен
-                    content = await response.read()
-                    with open(filepath, 'wb') as f:
-                        f.write(content)
-                    logger.info(f"Downloaded: {filepath.name}")
-                    return True
-                else:
-                    logger.error(f"Failed to download {url}: HTTP {response.status}")
-                    return False
-        except Exception as e:
-            logger.error(f"Error downloading {url}: {e}")
-            return False
-    
-    def get_unique_filename(self, base_name: str, ext: str) -> Path:
-        """Генерирует уникальное имя файла"""
-        counter = 0
-        while True:
-            if counter == 0:
-                filename = f"{base_name}.{ext}"
-            else:
-                filename = f"{base_name}_{counter}.{ext}"
-            
-            filepath = self.download_path / filename
-            if not filepath.exists():
-                return filepath
-            counter += 1
 
-class MaxMediaHandler:
-    """Обработчик медиа из Max"""
-    
-    def __init__(self, max_client: SocketMaxClient, downloader: MediaDownloader):
-        self.max_client = max_client
-        self.downloader = downloader
-    
-    async def download_photo(self, photo_attach: PhotoAttach) -> Optional[Path]:
-        """Скачивает фото из Max"""
-        try:
-            # Получаем фото через клиент
-            photo = Photo(
-                photo_id=photo_attach.photo_id,
-                token=photo_attach.photo_token
-            )
-            
-            # Генерируем URL для скачивания
-            # В реальности нужно использовать методы клиента для получения файла
-            # Для примера используем base_url
-            if photo_attach.base_url:
-                filename = self.downloader.get_unique_filename(
-                    f"photo_{photo_attach.photo_id}", 
-                    "jpg"
-                )
-                if await self.downloader.download_file(photo_attach.base_url, filename):
-                    return filename
-        except Exception as e:
-            logger.error(f"Error downloading photo {photo_attach.photo_id}: {e}")
-        return None
-    
-    async def download_video(self, video_attach: VideoAttach, chat_id: int, message_id: int) -> Optional[Path]:
-        """Скачивает видео из Max"""
-        try:
-            # Получаем видео через клиент
-            video_request = await self.max_client.get_video_by_id(
-                chat_id=chat_id,
-                message_id=message_id,
-                video_id=video_attach.video_id
-            )
-            
-            if video_request and video_request.url:
-                filename = self.downloader.get_unique_filename(
-                    f"video_{video_attach.video_id}",
-                    "mp4"
-                )
-                if await self.downloader.download_file(video_request.url, filename):
-                    return filename
-        except Exception as e:
-            logger.error(f"Error downloading video {video_attach.video_id}: {e}")
-        return None
-    
-    async def download_file(self, file_attach: FileAttach, chat_id: int, message_id: int) -> Optional[Path]:
-        """Скачивает файл из Max"""
-        try:
-            # Получаем файл через клиент
-            file_request = await self.max_client.get_file_by_id(
-                chat_id=chat_id,
-                message_id=message_id,
-                file_id=file_attach.file_id
-            )
-            
-            if file_request and file_request.url:
-                # Определяем расширение из имени файла
-                ext = file_attach.name.split('.')[-1] if '.' in file_attach.name else 'bin'
-                filename = self.downloader.get_unique_filename(
-                    f"file_{file_attach.file_id}",
-                    ext
-                )
-                if await self.downloader.download_file(file_request.url, filename):
-                    return filename
-        except Exception as e:
-            logger.error(f"Error downloading file {file_attach.file_id}: {e}")
-        return None
-
-class TelegramSender:
-    """Отправка сообщений в Telegram"""
-    
-    def __init__(self, token: str, chat_id: int, max_media_per_group: int = 10):
-        self.bot = Bot(token=token)
-        self.chat_id = chat_id
-        self.max_media_per_group = max_media_per_group
-    
-    async def send_message_with_media(self, text: str, media_files: List[Path]):
-        """Отправляет сообщение с медиа в Telegram"""
-        try:
-            if not media_files:
-                # Только текст
-                await self.send_text(text)
-                return
-            
-            # Группируем медиа по типам
-            photos = [f for f in media_files if f.suffix.lower() in ['.jpg', '.jpeg', '.png', '.gif']]
-            videos = [f for f in media_files if f.suffix.lower() in ['.mp4', '.mov', '.avi', '.mkv']]
-            documents = [f for f in media_files if f not in photos + videos]
-            
-            # Отправляем фото (можно группировать)
-            if photos:
-                await self._send_photo_group(photos, text)
-                text = ""  # Текст уже отправлен с фото
-            
-            # Отправляем видео (по одному, т.к. группировка видео не всегда работает)
-            if videos:
-                for video in videos:
-                    await self._send_single_video(video, text if text else None)
-                    text = ""  # Текст уже отправлен с первым видео
-            
-            # Отправляем документы
-            if documents:
-                for doc in documents:
-                    await self._send_document(doc, text if text else None)
-                    text = ""
-            
-            # Если остался текст и не было медиафайлов
-            if text and not (photos or videos or documents):
-                await self.send_text(text)
-                
-        except Exception as e:
-            logger.error(f"Error sending message with media: {e}")
-            raise
-    
-    async def _send_photo_group(self, photos: List[Path], caption: str = ""):
-        """Отправляет группу фото"""
-        media_group = []
-        
-        for i, photo_path in enumerate(photos[:self.max_media_per_group]):
-            with open(photo_path, 'rb') as f:
-                media = InputMediaPhoto(
-                    media=f,
-                    caption=caption if i == 0 else "",
-                    parse_mode=ParseMode.HTML
-                )
-                media_group.append(media)
-        
-        if media_group:
-            await self.bot.send_media_group(
-                chat_id=self.chat_id,
-                media=media_group
-            )
-            logger.info(f"Sent photo group with {len(media_group)} photos")
-    
-    async def _send_single_video(self, video_path: Path, caption: str = None):
-        """Отправляет одно видео"""
-        with open(video_path, 'rb') as f:
-            await self.bot.send_video(
-                chat_id=self.chat_id,
-                video=f,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                supports_streaming=True
-            )
-            logger.info(f"Sent video: {video_path.name}")
-    
-    async def _send_document(self, doc_path: Path, caption: str = None):
-        """Отправляет документ"""
-        with open(doc_path, 'rb') as f:
-            await self.bot.send_document(
-                chat_id=self.chat_id,
-                document=f,
-                caption=caption,
-                parse_mode=ParseMode.HTML
-            )
-            logger.info(f"Sent document: {doc_path.name}")
-    
-    async def send_text(self, text: str):
-        """Отправляет текстовое сообщение"""
-        try:
-            # Разбиваем длинные сообщения (Telegram лимит 4096 символов)
-            max_length = 4000
-            if len(text) <= max_length:
-                await self.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True
-                )
-            else:
-                # Разбиваем на части
-                parts = [text[i:i+max_length] for i in range(0, len(text), max_length)]
-                for i, part in enumerate(parts):
-                    prefix = f"<i>(Часть {i+1}/{len(parts)})</i>\n\n" if len(parts) > 1 else ""
-                    await self.bot.send_message(
-                        chat_id=self.chat_id,
-                        text=prefix + part,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True
-                    )
-            
-            logger.info("Sent text message")
-        except Exception as e:
-            logger.error(f"Error sending text: {e}")
-            raise
 
 class MaxForwarderBot:
     """Основной бот для пересылки сообщений из Max в Telegram"""
@@ -354,14 +109,9 @@ class MaxForwarderBot:
             registration=False  # Вход по существующему аккаунту
         )
         
-        # Инициализация компонентов
-        self.downloader = MediaDownloader(config.download_path, config.request_timeout)
-        self.media_handler = MaxMediaHandler(self.max_client, self.downloader)
-        self.telegram_sender = TelegramSender(
-            config.telegram_token,
-            config.telegram_chat_id,
-            config.max_media_per_group
-        )
+        # Инициализация Telegram бота
+        self.bot = Bot(token=config.telegram_token)
+        self.chat_id = config.telegram_chat_id
         
         # Регистрация обработчиков
         self._register_handlers()
@@ -442,10 +192,9 @@ class MaxForwarderBot:
             text = self._format_message_text(message)
             
             # Обрабатываем вложения
-            media_files = []
             media_links = []
             if message.attaches:
-                media_files, media_links = await self._download_attachments(message)
+                media_links = await self._get_media_links(message)
             
             # Формируем итоговый текст с ссылками на медиа
             final_text = ""
@@ -457,81 +206,81 @@ class MaxForwarderBot:
             final_text += text
             
             # Отправляем в Telegram
-            await self.telegram_sender.send_message_with_media(final_text, media_files)
+            try:
+                # Разбиваем длинные сообщения (Telegram лимит 4096 символов)
+                max_length = 4000
+                if len(final_text) <= max_length:
+                    await self.bot.send_message(
+                        chat_id=self.chat_id,
+                        text=final_text,
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True
+                    )
+                else:
+                    # Разбиваем на части
+                    parts = [final_text[i:i+max_length] for i in range(0, len(final_text), max_length)]
+                    for i, part in enumerate(parts):
+                        prefix = f"<i>(Часть {i+1}/{len(parts)})</i>\n\n" if len(parts) > 1 else ""
+                        await self.bot.send_message(
+                            chat_id=self.chat_id,
+                            text=prefix + part,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True
+                        )
+                
+                logger.info("Sent text message")
+            except Exception as e:
+                logger.error(f"Error sending text: {e}")
+                raise
             
             # Помечаем как обработанное
             self.state_manager.add_message(message_hash)
-            
-            # Очищаем временные файлы
-            for filepath in media_files:
-                try:
-                    filepath.unlink()
-                except Exception as e:
-                    logger.warning(f"Failed to delete temp file {filepath}: {e}")
             
             logger.info(f"Message {message.id} processed successfully")
             
         except Exception as e:
             logger.error(f"Error processing message {message.id}: {e}")
     
-    async def _download_attachments(self, message: Message) -> tuple[List[Path], List[str]]:
-        """Скачивает все вложения сообщения и возвращает файлы и ссылки"""
-        media_files = []
+    async def _get_media_links(self, message: Message) -> List[str]:
+        """Формирует HTML ссылки на вложения сообщения"""
         media_links = []
         
-        async with self.downloader:
-            for i, attach in enumerate(message.attaches):
-                try:
-                    if isinstance(attach, PhotoAttach):
-                        filepath = await self.media_handler.download_photo(attach)
-                        if filepath:
-                            media_files.append(filepath)
-                        else:
-                            # Если не удалось скачать, добавляем кликабельную ссылку
-                            if attach.base_url:
-                                media_links.append(f"[ФОТО #{i+1}]({attach.base_url})")
+        for i, attach in enumerate(message.attaches):
+            try:
+                if isinstance(attach, PhotoAttach):
+                    # Формируем HTML ссылку на фото
+                    if attach.base_url:
+                        media_links.append(f'<a href="{attach.base_url}">ФОТО #{i+1}</a>')
+                
+                elif isinstance(attach, VideoAttach):
+                    # Формируем HTML ссылку на видео
+                    video_request = await self.max_client.get_video_by_id(
+                        chat_id=message.chat_id,
+                        message_id=message.id,
+                        video_id=attach.video_id
+                    )
+                    if video_request and video_request.url:
+                        media_links.append(f'<a href="{video_request.url}">ВИДЕО #{i+1}</a>')
+                
+                elif isinstance(attach, FileAttach):
+                    # Формируем HTML ссылку на файл
+                    file_request = await self.max_client.get_file_by_id(
+                        chat_id=message.chat_id,
+                        message_id=message.id,
+                        file_id=attach.file_id
+                    )
+                    if file_request and file_request.url:
+                        media_links.append(f'<a href="{file_request.url}">ФАЙЛ #{i+1}</a>')
+                
+                else:
+                    logger.warning(f"Unsupported attachment type: {type(attach)}")
+                    continue
                     
-                    elif isinstance(attach, VideoAttach):
-                        filepath = await self.media_handler.download_video(
-                            attach, message.chat_id, message.id
-                        )
-                        if filepath:
-                            media_files.append(filepath)
-                        else:
-                            # Если не удалось скачать, добавляем кликабельную ссылку
-                            video_request = await self.max_client.get_video_by_id(
-                                chat_id=message.chat_id,
-                                message_id=message.id,
-                                video_id=attach.video_id
-                            )
-                            if video_request and video_request.url:
-                                media_links.append(f"[ВИДЕО #{i+1}]({video_request.url})")
-                    
-                    elif isinstance(attach, FileAttach):
-                        filepath = await self.media_handler.download_file(
-                            attach, message.chat_id, message.id
-                        )
-                        if filepath:
-                            media_files.append(filepath)
-                        else:
-                            # Если не удалось скачать, добавляем кликабельную ссылку
-                            file_request = await self.max_client.get_file_by_id(
-                                chat_id=message.chat_id,
-                                message_id=message.id,
-                                file_id=attach.file_id
-                            )
-                            if file_request and file_request.url:
-                                media_links.append(f"[ФАЙЛ #{i+1}]({file_request.url})")
-                    
-                    else:
-                        logger.warning(f"Unsupported attachment type: {type(attach)}")
-                        continue
-                        
-                except Exception as e:
-                    logger.error(f"Error processing attachment: {e}")
+            except Exception as e:
+                logger.error(f"Error processing attachment: {e}")
         
-        logger.info(f"Downloaded {len(media_files)} attachments, {len(media_links)} links")
-        return media_files, media_links
+        logger.info(f"Generated {len(media_links)} HTML links")
+        return media_links
     
     async def start(self):
         """Запускает бота"""
@@ -633,4 +382,4 @@ def main():
         raise
 
 if __name__ == "__main__":
-    main()        
+    main()
